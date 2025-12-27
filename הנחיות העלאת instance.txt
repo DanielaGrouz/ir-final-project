@@ -1,0 +1,53 @@
+1. do this:
+
+INSTANCE_NAME="instance-1"
+REGION=us-central1
+ZONE=us-central1-c
+PROJECT_NAME="ir-final-project-12016"
+IP_NAME="$PROJECT_NAME-ip"
+GOOGLE_ACCOUNT_NAME="rinat227722" # without the @post.bgu.ac.il or @gmail.com part
+
+# 0. Install Cloud SDK on your local machine or using Could Shell
+# check that you have a proper active account listed
+gcloud auth list 
+# check that the right project and zone are active
+gcloud config list
+# if not set them
+# gcloud config set project $PROJECT_NAME
+# gcloud config set compute/zone $ZONE
+
+# 1. Set up public IP
+gcloud compute addresses create $IP_NAME --project=$PROJECT_NAME --region=$REGION
+gcloud compute addresses list
+# note the IP address printed above, that's your extrenal IP address.
+INSTANCE_IP="35.239.201.94"
+
+# 2. Create Firewall rule to allow traffic to port 8080 on the instance
+gcloud compute firewall-rules create default-allow-http-8080 \
+  --allow tcp:8080 \
+  --source-ranges 0.0.0.0/0 \
+  --target-tags http-server
+
+# 3. Create the instance. Change to a larger instance (larger than e2-micro) as needed.
+gcloud compute instances create $INSTANCE_NAME \
+  --zone=$ZONE \
+  --machine-type=e2-standard-4 \
+  --network-interface=address=$INSTANCE_IP,network-tier=PREMIUM,subnet=default \
+  --metadata-from-file startup-script=startup_script_gcp.sh \
+  --scopes=https://www.googleapis.com/auth/cloud-platform \
+  --tags=http-server
+
+2. go to instances -> ssh
+upload this files:
+- startup_script_gcp.sh 
+- search_frontend.py
+- inverted_index_gcp.py
+
+3. run this commands:
+chmod +x startup_script_gcp.sh 
+sudo ./startup_script_gcp.sh 
+
+4. run the server:
+~/venv/bin/python ~/search_frontend.py
+
+5. test in post man
