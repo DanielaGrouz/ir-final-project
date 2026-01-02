@@ -20,13 +20,8 @@ def get_bucket(bucket_name):
     return storage.Client(PROJECT_ID).bucket(bucket_name)
 
 class GCSFileWriterWrapper:
-    """
-    כותב ישירות לדיסק המקומי כדי לחסוך ב-RAM.
-    מתאים במיוחד למכונות 'רגילות' עם מעט זיכרון.
-    """
     def __init__(self, blob):
         self.blob = blob
-        # יצירת נתיב זמני על הדיסק הקשיח
         self.temp_path = f"/tmp/{os.path.basename(blob.name)}"
         self.file = open(self.temp_path, 'wb')
         self.name = blob.name
@@ -37,7 +32,6 @@ class GCSFileWriterWrapper:
     def tell(self):
         return self.file.tell()
 
-    # הוספת תמיכה ב-Context Manager (תיקון השגיאה)
     def __enter__(self):
         return self
 
@@ -47,9 +41,7 @@ class GCSFileWriterWrapper:
     def close(self):
         if not self.file.closed:
             self.file.close()
-            # העלאה מהדיסק ל-GCS
             self.blob.upload_from_filename(self.temp_path)
-            # מחיקת הקובץ הזמני מהדיסק
             if os.path.exists(self.temp_path):
                 os.remove(self.temp_path)
 
@@ -63,7 +55,6 @@ def _open(path, mode, bucket=None):
         return GCSFileWriterWrapper(blob)
 
 
-# Let's start with a small block size of 30 bytes just to test things out. 
 BLOCK_SIZE = 1999998
 
 class MultiFileWriter:

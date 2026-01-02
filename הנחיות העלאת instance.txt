@@ -45,6 +45,7 @@ upload this files:
 
 3. run this commands:
 chmod +x startup_script_gcp.sh 
+sed -i 's/\r$//' startup_script_gcp.sh
 sudo ./startup_script_gcp.sh 
 
 4. run the server:

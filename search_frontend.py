@@ -13,6 +13,7 @@ from sentence_transformers import SentenceTransformer, util
 from typing import List
 import pandas as pd
 import os
+import heapq
 
 nltk.download('stopwords')
 client = storage.Client()
@@ -48,6 +49,12 @@ def download_df(prefix):
         blob.download_to_filename(local_file_path)
 
 def load_resources():
+    """
+    Downloads and loads all necessary metadata, statistics, and mappings 
+    required for the search engine's ranking and retrieval logic.
+    """
+
+    # download and load statistical data for different fields
     files = ["anchor_stats.pkl", "title_stats.pkl", "body_stats.pkl"]
     for file_name in files:
         client.bucket(data_bucket_name).blob(f"{storage_output_folder}/stats/{file_name}.pkl").download_to_filename(file_name)
@@ -57,20 +64,24 @@ def load_resources():
         title_data = pickle.load(f)
     with open('anchor_stats.pkl', 'rb') as f:
         anchor_data = pickle.load(f)
+
+    # download and load PageRank scores
     client.bucket(data_bucket_name).blob(f"{storage_output_folder}/mappings/pagerank_dict.pkl").download_to_filename("pagerank_dict.pkl")
     with open("pagerank_dict.pkl", "rb") as f:
         pagerank_dict = pickle.load(f)
-    # client.bucket(data_bucket_name).blob(f"{storage_output_folder}/pageviews-202108-user.pkl").download_to_filename(
-    #     "pageviews-202108-user.pkl")
-    # with open("pageviews-202108-user.pkl", "rb") as f:
-    #     wid2pv = pickle.load(f)
+
+    # download and load PageView statistics
     client.bucket(data_bucket_name).blob(f"{storage_output_folder}/mappings/pageview_dict.pkl").download_to_filename("pageview_dict.pkl")
     with open("pageview_dict.pkl", "rb") as f:
         wid2pv = pickle.load(f)
+
+    # downloads a Parquet file mapping Document IDs to their actual string titles
     prefix = f"{storage_output_folder}/titles_df"
     download_df(prefix)
     df = pd.read_parquet("titles_df", engine='pyarrow')
     title_df = df.set_index("id")["title"]
+
+    # document length is essential for normalizing scores
     dl_by_field = dict()
     for field_name in ["anchor", "body", "title"]:
         prefix = f"{storage_output_folder}/stats/dl_{field_name}.parquet"
@@ -78,6 +89,7 @@ def load_resources():
         curr = pd.read_parquet(f"dl_{field_name}.parquet", engine='pyarrow')
         curr.set_index("id")["len"]
         dl_by_field[field_name] = curr
+
     return body_data, title_data, anchor_data, title_df, pagerank_dict, wid2pv, dl_by_field
 
 
@@ -85,7 +97,6 @@ def load_resources():
 def read_inverted_index(index_name: str):
     # read the inverted index from storage
     index_dst = f"{index_name}.pkl"
-    # client.bucket(data_bucket_name).blob(f"inverted_indecies_test/{index_name}.pkl").download_to_filename(index_dst)
     client.bucket(data_bucket_name).blob(f"{storage_output_folder}/inverted_indecies/{index_name}.pkl").download_to_filename(
         index_dst
     )
@@ -93,16 +104,16 @@ def read_inverted_index(index_name: str):
         return pickle.load(f)
 
 
+#load the inverted indicies
 body_inverted_index = read_inverted_index("body_inverted_index")
 title_inverted_index = read_inverted_index("title_inverted_index")
 inverted_anchor = read_inverted_index("ancher_inverted_index")
 
-# body_inverted_index_smart = read_inverted_index("body_inverted_index_smart")
+# smart indecies
 title_inverted_index_smart = read_inverted_index("title_inverted_index_smart")
 anchor_inverted_index_smart = read_inverted_index("ancher_inverted_index_smart")
 
 BODY_STATS, TITLE_STATS, ANCHOR_STATS, TITLES_DF, PAGERANK_DICT, WID2PV, DL_BY_FIELD = load_resources()
-
 
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
@@ -114,6 +125,10 @@ app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
 
 def tokenize_smart(text):
+    """
+    Advanced tokenization: Downcasing, Stopword removal, Stemming, and Bigrams.
+    Used for 'Title' field to capture high-intent phrases.
+    """
     tokens = [tok.group().lower() for tok in RE_WORD.finditer(text)]
     tokens = [tok for tok in tokens if tok not in all_stopwords]
     tokens = [stemmer.stem(tok) for tok in tokens]
@@ -122,6 +137,10 @@ def tokenize_smart(text):
 
 
 def search_helper(query: str, inverted_index):
+    """
+    Ranks documents by the count of distinct query terms present.
+    Often used as a fallback or for anchor-text-only searches.
+    """
     query_tokens = {
         tok.group().lower()
         for tok in RE_WORD.finditer(query)
@@ -169,6 +188,7 @@ def tokenize_text(text_element, tokenize_func):
     return tokenize_func(full_text)
 
 def simple_tokenize(full_text: str) -> List[str]:
+    """Standard tokenization: Downcasing and stopword removal only."""
     return  [
         tok.group().lower()
         for tok in RE_WORD.finditer(full_text)
@@ -185,34 +205,46 @@ def tokenize_anchor(text):
     ]
 
 def get_bm25_scores(query: str):
-    k1, b = 1.5, 0.75
+    """
+    Calculates the BM25 score across multiple inverted indices.
+    Weights are tuned to favor Title and Anchor matches over Body matches.
+    """
+    k1, b = 1.5, 0.75 # BM25 Hyperparameters
     candidate_scores = defaultdict(float)
 
+    # Configuration for multi-field search
     fields = [
-        (body_inverted_index, BODY_STATS, 0, simple_tokenize, DL_BY_FIELD["body"]),
-        (title_inverted_index_smart, TITLE_STATS, 0.7, tokenize_smart, DL_BY_FIELD["title"]),
-        (anchor_inverted_index_smart, ANCHOR_STATS, 0.3, tokenize_anchor, DL_BY_FIELD["anchor"])
+        (body_inverted_index, BODY_STATS, 0.1, simple_tokenize, DL_BY_FIELD["body"]),  # Low noise
+        (title_inverted_index_smart, TITLE_STATS, 0.6, tokenize_smart, DL_BY_FIELD["title"]), # Max Signal
+        (anchor_inverted_index_smart, ANCHOR_STATS, 0.3, tokenize_anchor, DL_BY_FIELD["anchor"]) # High Signal
     ]
 
     for index, stats, weight, tokenize_func, dl_df in fields:
+        # Preprocess query specifically for the current field's requirements
         query_tokens = tokenize_text(query, tokenize_func)
         unique_tokens = np.unique(query_tokens)
 
         avgdl = stats['avgdl']
 
         for term in unique_tokens:
-            n_ti = index.df.get(term, 0)
+            n_ti = index.df.get(term, 0) # Number of docs containing the term
             if n_ti == 0:
                 continue
 
+            # Inverse Document Frequency: Rare words get higher scores
             idf = math.log(1 + (len(TITLES_DF) - n_ti + 0.5) / (n_ti + 0.5))
 
             try:
+                # Retrieve list of [doc_id, frequency] from the inverted index
                 pls = index.read_a_posting_list('.', term, data_bucket_name)
                 for doc_id, freq in pls:
                     doc_len = dl_df.get(doc_id, avgdl)
+
+                    # BM25 core formula
                     denominator = freq + k1 * (1 - b + b * (doc_len / avgdl))
                     score = idf * (freq * (k1 + 1)) / denominator
+
+                    # Accumulate weighted score across all fields
                     candidate_scores[doc_id] += (score * weight)
             except Exception:
                 continue
@@ -220,32 +252,69 @@ def get_bm25_scores(query: str):
 
 
 def get_semantic_similarity(query, titles):
+    """
+    Computes the semantic overlap between a search query and a list of titles
+    using Vector Embeddings and Cosine Similarity.
+    """
     if not titles:
         return []
+    
+    # The 'semantic_model' captures the context and meaning of the words
     query_emb = semantic_model.encode(query, convert_to_tensor=True)
     title_embs = semantic_model.encode(titles, convert_to_tensor=True)
+
+    # score closer to 1.0 means the query and title are semantically very similar
     semantic_sims = util.cos_sim(query_emb, title_embs)[0].tolist()
     return semantic_sims
 
 
+def min_max_normalize(values):
+    """
+    Scales a list of scores into a fixed range of [0, 1].
+    This is essential before 'Ensemble Ranking' (combining different scoring signals).
+    """
+    min_val = min(values)
+    max_val = max(values)
+    # Handle the edge case where all scores are the same
+    if max_val == min_val:
+        return [0.5] * len(values)
+    
+    # Standard Min-Max Scaling formula: (value - min) / (max - min)
+    return [(x - min_val) / (max_val - min_val) for x in values]
+
+
 def rank_candidates(query, top_candidates_scores):
+    # extract raw data
     candidate_ids = [int(cid) for cid, _ in top_candidates_scores]
-
     titles = [TITLES_DF.get(cid, "Unknown") for cid in candidate_ids]
-    semantic_sims = get_semantic_similarity(query, titles)
+    
+    # compute Raw Feature Vectors
+    bm25_scores = [score for _, score in top_candidates_scores]
+    
+    # Semantic Vector (Title Similarity)
+    semantic_scores = get_semantic_similarity(query, titles)
+    
+    # PageRank Vector (Log-transformed to handle power-law distribution)
+    pr_scores = [math.log(PAGERANK_DICT.get(cid, 1e-6) + 1e-10) for cid in candidate_ids]
+    
+    # PageViews Vector (Log-transformed)
+    pv_scores = [math.log(WID2PV.get(cid, 0) + 1) for cid in candidate_ids]
 
+    # normalize Features to [0, 1]
+    bm25_norm = min_max_normalize(bm25_scores)
+    sem_norm = min_max_normalize(semantic_scores)
+    pr_norm = min_max_normalize(pr_scores)
+    pv_norm = min_max_normalize(pv_scores)
+
+    # weighted Combination
     final_ranked_list = []
     for i, cid in enumerate(candidate_ids):
-        bm25_val = dict(top_candidates_scores).get(cid, 0)
-        pr_val = PAGERANK_DICT.get(cid, 0)
-        pv_val = math.log1p(WID2PV.get(cid, 0))
-        sem_val = semantic_sims[i] if i < len(semantic_sims) else 0
-
-        final_score = (bm25_val * 0.5) + (sem_val * 0.3) + (pr_val * 0.1) + (pv_val * 0.1)
+        final_score = (
+            (bm25_norm[i] * 0.7) +  (sem_norm[i]  * 0.2) +   (pv_norm[i]   * 0.05) +   (pr_norm[i]   * 0.05)    
+        )
         final_ranked_list.append((str(cid), titles[i], final_score))
 
     return sorted(final_ranked_list, key=lambda x: x[2], reverse=True)
-
 
 @app.route("/search")
 def search():
@@ -273,10 +342,14 @@ def search():
     # BEGIN SOLUTION
     query_tokens = tokenize_smart(query)
     if query_tokens:
+        # get initial scores for all documents containing query terms
         all_bm25_scores = get_bm25_scores(query)
         if all_bm25_scores:
-            top_150 = sorted(all_bm25_scores.items(), key=lambda x: x[1], reverse=True)[:150]
-            final_results = rank_candidates(query, top_150)
+            # use a heap to efficiently find top 200 scores (O(N log 200))
+            top_candidates = heapq.nlargest(200, all_bm25_scores.items(), key=lambda x: x[1])
+            # pass candidates to the ranking function
+            final_results = rank_candidates(query, top_candidates)
+            # Return the top 100 as (wiki_id, title) tuples
             res = [(res[0], res[1]) for res in final_results[:100]]
     # END SOLUTION
     return jsonify(res)
@@ -391,7 +464,7 @@ def get_pagerank():
     if len(wiki_ids) == 0:
         return jsonify(res)
     # BEGIN SOLUTION
-    # dataFrame for inner join -> fast
+    # defaults to 0.0 if the ID is not found
     res = [PAGERANK_DICT.get(int(wid), 0.0) for wid in wiki_ids]
     # END SOLUTION
     return jsonify(res)
@@ -420,6 +493,7 @@ def get_pageview():
     if len(wiki_ids) == 0:
         return jsonify(res)
     # BEGIN SOLUTION
+    # defaults to 0 if the ID is not found
     res = [WID2PV.get(int(wid), 0) for wid in wiki_ids]
     # END SOLUTION
     return jsonify(res)
