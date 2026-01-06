@@ -10,7 +10,6 @@ The codebase is organized into three main components:
 3. **`search_frontend.py`**: The runtime search API and ranking engine.
 
 ---
-
 ### 1. `inverted_index_gcp.py`
 **Role:** Core Library
 
